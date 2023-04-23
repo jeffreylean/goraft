@@ -39,8 +39,7 @@ type Server struct {
 	timerChan       chan bool
 	healthCheckChan chan bool
 
-	cluster     config.Cluster
-	connections []*raft.RaftServiceClient
+	cluster config.Cluster
 }
 
 func Create(path string) *Server {
@@ -51,7 +50,6 @@ func Create(path string) *Server {
 		timerChan:       make(chan bool),
 		healthCheckChan: make(chan bool),
 		cluster:         conf.Cluster,
-		connections:     make([]*raft.RaftServiceClient, 0),
 	}
 	raft.RegisterRaftServiceServer(s.GrpcServer, &s)
 
@@ -62,7 +60,7 @@ func (s *Server) Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	s.Cancel = cancel
 
-	listen, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cluster.ID))
+	listen, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cluster.Port))
 	defer listen.Close()
 	if err != nil {
 		log.Printf("Err:%v", err)

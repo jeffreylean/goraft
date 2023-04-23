@@ -9,7 +9,6 @@ import (
 
 	"github.com/jeffreylean/goraft/client"
 	raft "github.com/jeffreylean/goraft/proto"
-	"google.golang.org/grpc"
 )
 
 type Role int
@@ -64,24 +63,23 @@ func (s *Server) InitializeState(ctx context.Context) {
 				case Leader:
 					log.Println("Role changed to leader")
 					healthCheckInterval := time.Duration(time.Microsecond * 50)
-					for _, addr := range s.cluster.Routes {
-						conn, err := grpc.Dial(addr)
-						if err != nil {
-							log.Printf("Err create grpc client: %v", err)
-							continue
-						}
-						client := raft.NewRaftServiceClient(conn)
-						s.connections = append(s.connections, &client)
-					}
 					// Create grpc Client
 					c, err := client.Dial(s.cluster.Routes)
 					if err != nil {
 						log.Printf("Err create grpc client: %v", err)
 					}
 					for {
-						// Send healthCheck every 50 ms
-						time.Sleep(healthCheckInterval)
-						c.AppendEntries(ctx, int64(s.CurrentTerm), int64(s.cluster.ID), 0, 0, []*raft.LogEntry{})
+						select {
+						case <-ctx.Done():
+							fmt.Println("Close conn")
+							for conn := range c.ServiceConn {
+								conn.Close()
+							}
+						default:
+							// Send healthCheck every 50 ms
+							time.Sleep(healthCheckInterval)
+							c.AppendEntries(ctx, int64(s.CurrentTerm), int64(s.cluster.ID), 0, 0, []*raft.LogEntry{})
+						}
 					}
 
 				case Follower, Init:
@@ -102,17 +100,14 @@ func (s *Server) InitializeState(ctx context.Context) {
 				case Candidate:
 					// crate connections to all the nodes within the cluster
 					log.Printf("server: Creating connection with %v", s.cluster.Routes)
-					for _, addr := range s.cluster.Routes {
-						conn, err := grpc.Dial(addr)
-						if err != nil {
-							log.Printf("Err create grpc client: %v", err)
-							continue
-						}
-						client := raft.NewRaftServiceClient(conn)
-						s.connections = append(s.connections, &client)
-					}
 					// Create grpc Client
 					c, err := client.Dial(s.cluster.Routes)
+					defer func() {
+						fmt.Println("Close conn")
+						for conn := range c.ServiceConn {
+							conn.Close()
+						}
+					}()
 					if err != nil {
 						log.Printf("Err create grpc client: %v", err)
 					}

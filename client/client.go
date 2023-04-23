@@ -2,32 +2,31 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math"
 
 	raft "github.com/jeffreylean/goraft/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
 
 type Client struct {
-	RaftService []raft.RaftServiceClient
-	Conn        []*grpc.ClientConn
+	ServiceConn map[*grpc.ClientConn]raft.RaftServiceClient
 }
 
 func Dial(routes []string) (*Client, error) {
 	client := &Client{
-		RaftService: make([]raft.RaftServiceClient, 0),
-		Conn:        make([]*grpc.ClientConn, 0),
+		ServiceConn: make(map[*grpc.ClientConn]raft.RaftServiceClient, 0),
 	}
 
 	for _, addr := range routes {
-		conn, err := grpc.Dial(addr)
+		conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithBlock())
 		if err != nil {
 			return nil, err
 		}
-		client.Conn = append(client.Conn, conn)
 		service := raft.NewRaftServiceClient(conn)
-		client.RaftService = append(client.RaftService, service)
+		client.ServiceConn[conn] = service
 	}
 	return client, nil
 }
@@ -40,7 +39,7 @@ func (c *Client) RequestVote(ctx context.Context, term, serverId, lastLogIndex, 
 		LastLogTerm:  lastLogTerm,
 	}
 	// Number of vote needed to win an election
-	majorityCount := math.Floor((float64(len(c.Conn)) / 2) + 1)
+	majorityCount := math.Floor((float64(len(c.ServiceConn)) / 2) + 1)
 	// Count number of current vote
 	// Start from one because candidate vote for itself
 	voteCount := 1
@@ -48,14 +47,18 @@ func (c *Client) RequestVote(ctx context.Context, term, serverId, lastLogIndex, 
 	respChan := make(chan *raft.RequestVoteResponse)
 
 	// Concurrently send vote requets
-	for _, each := range c.RaftService {
+	for conn, service := range c.ServiceConn {
 		go func(s raft.RaftServiceClient) {
-			resp, err := s.RequestVote(ctx, req)
-			if err != nil {
-				log.Printf("Err: Error requesting response %v", err)
+			// Only need to send to established connection
+			fmt.Println(conn.GetState())
+			if conn.GetState() == connectivity.Ready {
+				resp, err := s.RequestVote(ctx, req)
+				if err != nil {
+					log.Printf("Err: Error requesting response %v", err)
+				}
+				respChan <- resp
 			}
-			respChan <- resp
-		}(each)
+		}(service)
 	}
 
 	for {
@@ -93,13 +96,17 @@ func (c *Client) AppendEntries(ctx context.Context, term, leaderId, prevLogIndex
 	}
 
 	// Concurrently send append requets/ healthcheck
-	for _, each := range c.RaftService {
+	for conn, service := range c.ServiceConn {
 		go func(s raft.RaftServiceClient) {
-			_, err := s.AppendEntries(ctx, req)
-			if err != nil {
-				log.Printf("Err: Error requesting response %v", err)
+			// Only need to send to established connection
+			fmt.Println(conn.GetState())
+			if conn.GetState() == connectivity.Ready {
+				_, err := s.AppendEntries(ctx, req)
+				if err != nil {
+					log.Printf("Err: Error requesting response %v", err)
+				}
 			}
-		}(each)
+		}(service)
 	}
 	return nil
 }
