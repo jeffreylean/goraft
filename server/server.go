@@ -4,28 +4,17 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
-	"time"
 
+	"github.com/jeffreylean/goraft/config"
+	l "github.com/jeffreylean/goraft/log"
 	raft "github.com/jeffreylean/goraft/proto"
 	"google.golang.org/grpc"
 )
 
-type Role int
-
-const (
-	Leader    Role = 0
-	Follower  Role = 1
-	Candidate Role = 1
-)
-
 type Server struct {
 	GrpcServer *grpc.Server
-	port       int
 	Cancel     context.CancelFunc
-	// Server ID
-	ID int
 	// Current Term. Last term seen by the server. It increments from 0 and increases monotonically. The leader will increment by 1 before sending AppendEntries the the follower.
 	// The follower will compare this term with the incoming Term (typically from leader) which will be populated in AppendEntries, if incoming term is higher than the
 	// CurrentTerm, it updates its CurrentTerm to the higher value and transition to follower state.
@@ -44,76 +33,68 @@ type Server struct {
 	LastApplied int
 	Role        Role
 	VotedFor    int
+	Logs        []l.LogEntry
+	State       *State
 
 	timerChan       chan bool
 	healthCheckChan chan bool
+
+	cluster     config.Cluster
+	connections []*raft.RaftServiceClient
 }
 
-func Create(port int, id int) *Server {
+func Create(path string) *Server {
+	// Load config
+	conf := config.Load(path)
 	s := Server{
-		ID:              id,
 		GrpcServer:      grpc.NewServer(),
-		port:            port,
 		timerChan:       make(chan bool),
 		healthCheckChan: make(chan bool),
+		cluster:         conf.Cluster,
+		connections:     make([]*raft.RaftServiceClient, 0),
 	}
 	raft.RegisterRaftServiceServer(s.GrpcServer, &s)
 
 	return &s
 }
 
-func (s *Server) Start(ctx context.Context) error {
+func (s *Server) Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	s.Cancel = cancel
 
-	listen, err := net.Listen("tcp", fmt.Sprintf(":%d", s.port))
+	listen, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cluster.ID))
 	defer listen.Close()
 	if err != nil {
-		return err
+		log.Printf("Err:%v", err)
+		cancel()
 	}
 
-	go func(ctx context.Context) {
-		ctx, cancel = context.WithCancel(ctx)
-		log.Printf("server: Listening for grpc on :%d", s.port)
-		if err := s.GrpcServer.Serve(listen); err == nil {
-			log.Printf("Err:%v", err)
-			cancel()
-		}
-	}(ctx)
+	s.InitializeState(ctx)
 
-	s.StartTimer()
-	for {
-		select {
-		case <-ctx.Done():
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-		case <-s.timerChan:
-			fmt.Println("New election!!")
-		case <-s.healthCheckChan:
-			fmt.Println("reset timer!!")
-			s.StartTimer()
-		}
+	log.Printf("server: Listening for grpc on :%d", s.cluster.Port)
+	if err := s.GrpcServer.Serve(listen); err == nil {
+		log.Printf("Err:%v", err)
+		cancel()
 	}
-}
-
-func (s *Server) StartTimer() {
-	go func() {
-		duration := rand.Intn(300-150) + 150
-		time.Sleep(time.Microsecond * time.Duration(duration))
-		s.healthCheckChan <- true
-	}()
-	go func() {
-		duration := rand.Intn(300-150) + 150
-		time.Sleep(time.Microsecond * time.Duration(duration))
-		s.timerChan <- true
-	}()
 }
 
 func (s *Server) AppendEntries(ctx context.Context, request *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+	// It's a healthcheck
+	if len(request.Entries) == 0 {
+		log.Printf("Health check received from leader %d", request.LeaderId)
+		s.healthCheckChan <- true
+	}
 	return nil, nil
 }
 
 func (s *Server) RequestVote(ctx context.Context, request *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error) {
-	return nil, nil
+	if request.Term < int64(s.CurrentTerm) {
+		return &raft.RequestVoteResponse{Term: int64(s.CurrentTerm), VoteGranted: false}, nil
+	}
+	if s.VotedFor != int(request.CandidateId) && s.CurrentTerm != int(request.Term) {
+		s.VotedFor = int(request.CandidateId)
+		s.CurrentTerm = int(request.Term)
+		return &raft.RequestVoteResponse{Term: int64(s.CurrentTerm), VoteGranted: true}, nil
+	}
+	return &raft.RequestVoteResponse{Term: int64(s.CurrentTerm), VoteGranted: false}, nil
 }
