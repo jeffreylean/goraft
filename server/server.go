@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
+	"time"
 
+	"github.com/jeffreylean/goraft/client"
 	"github.com/jeffreylean/goraft/config"
 	l "github.com/jeffreylean/goraft/log"
 	raft "github.com/jeffreylean/goraft/proto"
@@ -36,43 +39,53 @@ type Server struct {
 	Logs        []l.LogEntry
 	State       *State
 
-	timerChan       chan bool
-	healthCheckChan chan bool
-
-	cluster config.Cluster
+	cluster            config.Cluster
+	mu                 sync.Mutex
+	healthCheckTimeOut time.Time
+	electionTimeOut    time.Time
+	client             *client.Client
 }
 
 func Create(path string) *Server {
 	// Load config
 	conf := config.Load(path)
 	s := Server{
-		GrpcServer:      grpc.NewServer(),
-		timerChan:       make(chan bool),
-		healthCheckChan: make(chan bool),
-		cluster:         conf.Cluster,
+		GrpcServer:         grpc.NewServer(),
+		healthCheckTimeOut: time.Now(),
+		cluster:            conf.Cluster,
+		mu:                 sync.Mutex{},
 	}
 	raft.RegisterRaftServiceServer(s.GrpcServer, &s)
 
 	return &s
 }
 
-func (s *Server) Start(ctx context.Context) {
-	ctx, cancel := context.WithCancel(ctx)
-	s.Cancel = cancel
-
+func (s *Server) Start(ctx context.Context, errChan chan error) {
 	listen, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cluster.Port))
 	defer listen.Close()
 	if err != nil {
 		log.Printf("Err:%v", err)
-		cancel()
+		errChan <- err
 	}
 
+	log.Printf("server: Creating connection with %v", s.cluster.Routes)
+	c, err := client.Dial(s.cluster.Routes)
+	if err != nil {
+		log.Println("Sever:", err)
+	}
+	s.client = c
 	s.InitializeState(ctx)
 
 	log.Printf("server: Listening for grpc on :%d", s.cluster.Port)
-	if err := s.GrpcServer.Serve(listen); err == nil {
-		log.Printf("Err:%v", err)
-		cancel()
+	if err := s.GrpcServer.Serve(listen); err != nil {
+		log.Printf("Server Err:%v", err)
+		// Close all connection
+		for conn := range c.ServiceConn {
+			if conn != nil {
+				conn.Close()
+			}
+		}
+		errChan <- err
 	}
 }
 
@@ -80,9 +93,9 @@ func (s *Server) AppendEntries(ctx context.Context, request *raft.AppendEntriesR
 	// It's a healthcheck
 	if len(request.Entries) == 0 {
 		log.Printf("Health check received from leader %d", request.LeaderId)
-		s.healthCheckChan <- true
+		s.HealthCheckTimer()
 	}
-	return nil, nil
+	return &raft.AppendEntriesResponse{Success: true, Term: int64(s.CurrentTerm)}, nil
 }
 
 func (s *Server) RequestVote(ctx context.Context, request *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error) {

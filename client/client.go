@@ -15,20 +15,31 @@ type Client struct {
 	ServiceConn map[*grpc.ClientConn]raft.RaftServiceClient
 }
 
-func Dial(routes []string) (*Client, error) {
-	client := &Client{
-		ServiceConn: make(map[*grpc.ClientConn]raft.RaftServiceClient, 0),
-	}
-
+func DialAsync(routes []string, connChan chan *grpc.ClientConn) {
 	for _, addr := range routes {
-		conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithBlock())
-		if err != nil {
-			return nil, err
-		}
-		service := raft.NewRaftServiceClient(conn)
-		client.ServiceConn[conn] = service
+		go func(addr string) {
+			for {
+				conn, err := grpc.Dial(addr, grpc.WithInsecure())
+				if err == nil && conn.GetState() == connectivity.Ready {
+					fmt.Println("connected")
+					connChan <- conn
+					return
+				}
+			}
+		}(addr)
 	}
-	return client, nil
+}
+
+func Dial(routes []string) (*Client, error) {
+	c := Client{ServiceConn: make(map[*grpc.ClientConn]raft.RaftServiceClient)}
+	for _, addr := range routes {
+		conn, err := grpc.Dial(addr, grpc.WithInsecure())
+		if err == nil {
+			service := raft.NewRaftServiceClient(conn)
+			c.ServiceConn[conn] = service
+		}
+	}
+	return &c, nil
 }
 
 func (c *Client) RequestVote(ctx context.Context, term, serverId, lastLogIndex, lastLogTerm int64) (int64, bool, error) {
@@ -48,17 +59,18 @@ func (c *Client) RequestVote(ctx context.Context, term, serverId, lastLogIndex, 
 
 	// Concurrently send vote requets
 	for conn, service := range c.ServiceConn {
-		go func(s raft.RaftServiceClient) {
+		go func(s raft.RaftServiceClient, conn *grpc.ClientConn) {
 			// Only need to send to established connection
-			fmt.Println(conn.GetState())
-			if conn.GetState() == connectivity.Ready {
-				resp, err := s.RequestVote(ctx, req)
-				if err != nil {
-					log.Printf("Err: Error requesting response %v", err)
+			if conn != nil {
+				if conn.GetState() == connectivity.Ready {
+					resp, err := s.RequestVote(ctx, req)
+					if err != nil {
+						log.Printf("Err: Error requesting response %v", err)
+					}
+					respChan <- resp
 				}
-				respChan <- resp
 			}
-		}(service)
+		}(service, conn)
 	}
 
 	for {
@@ -86,7 +98,6 @@ func (c *Client) RequestVote(ctx context.Context, term, serverId, lastLogIndex, 
 }
 
 func (c *Client) AppendEntries(ctx context.Context, term, leaderId, prevLogIndex, leaderCommit int64, logEntries []*raft.LogEntry) error {
-
 	req := &raft.AppendEntriesRequest{
 		Term:         term,
 		LeaderId:     leaderId,
@@ -97,16 +108,15 @@ func (c *Client) AppendEntries(ctx context.Context, term, leaderId, prevLogIndex
 
 	// Concurrently send append requets/ healthcheck
 	for conn, service := range c.ServiceConn {
-		go func(s raft.RaftServiceClient) {
+		go func(s raft.RaftServiceClient, conn *grpc.ClientConn) {
 			// Only need to send to established connection
-			fmt.Println(conn.GetState())
-			if conn.GetState() == connectivity.Ready {
+			if conn != nil {
 				_, err := s.AppendEntries(ctx, req)
 				if err != nil {
 					log.Printf("Err: Error requesting response %v", err)
 				}
 			}
-		}(service)
+		}(service, conn)
 	}
 	return nil
 }
