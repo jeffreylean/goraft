@@ -4,8 +4,6 @@ import (
 	"context"
 	"log"
 	"time"
-
-	raft "github.com/jeffreylean/goraft/proto"
 )
 
 type Role int
@@ -51,7 +49,7 @@ func (s *Server) InitializeState(ctx context.Context) {
 			case Leader:
 				if time.Now().After(s.healthCheckTimeOut) {
 					s.HealthCheckTimer()
-					s.client.AppendEntries(ctx, int64(s.CurrentTerm), int64(s.ID), 0, 0, []*raft.LogEntry{})
+					s.SendAppendEntries(ctx)
 				}
 			case Follower, Init:
 				// Give some buffer time for the leader to connect to this node if there is any
@@ -63,7 +61,7 @@ func (s *Server) InitializeState(ctx context.Context) {
 				}
 			case Candidate:
 				// Request for vote
-				// Increate current term first
+				// Increase current term first
 				s.mu.Lock()
 				s.CurrentTerm++
 				s.mu.Unlock()
@@ -74,12 +72,12 @@ func (s *Server) InitializeState(ctx context.Context) {
 					lastLogIndex = int64(logEntry.Index)
 					lastLogTerm = int64(logEntry.Term)
 				}
-				latestTerm, success, err := s.client.RequestVote(ctx, int64(s.CurrentTerm), int64(s.ID), lastLogIndex, lastLogTerm)
+				latestTerm, success, err := s.SendRequestVote(ctx, int64(s.CurrentTerm), int64(s.ID), lastLogIndex, lastLogTerm)
 				if err != nil {
 					log.Printf("Err from request Vote: %v", err)
 					continue
 				}
-				s.CurrentTerm = int(latestTerm)
+				s.CurrentTerm = uint64(latestTerm)
 				if success {
 					// Win election and turn the state to Leader
 					s.HandleEvent(WinElection)
